@@ -36,12 +36,13 @@
       : null;
 
     function setHasImage(enabled) {
+      // Mirror the preview availability so layout and accessibility stay in sync.
       if (!dropzone) {
         return;
       }
       dropzone.classList.toggle("has-image", Boolean(enabled));
-      if (thumbnailRemove) {
-        thumbnailRemove.style.display = enabled ? "flex" : "none";
+      if (thumbnailWrapper) {
+        thumbnailWrapper.hidden = !enabled;
       }
     }
 
@@ -70,6 +71,9 @@
         if (typeof result === "string") {
           thumbnailImage.src = result;
           thumbnailImage.hidden = false;
+          if (thumbnailWrapper) {
+            thumbnailWrapper.hidden = false;
+          }
           setHasImage(true);
         }
       };
@@ -82,6 +86,9 @@
       }
       thumbnailImage.src = url;
       thumbnailImage.hidden = false;
+      if (thumbnailWrapper) {
+        thumbnailWrapper.hidden = false;
+      }
       setHasImage(true);
     }
 
@@ -181,12 +188,26 @@
       applyTransform();
     }
 
+    function updatePanState() {
+      // Toggle helper classes so the cursor reflects whether panning is available.
+      if (!modalZoomContainer) {
+        return;
+      }
+      if (scale > 1.01) {
+        modalZoomContainer.classList.add("can-pan");
+      } else {
+        modalZoomContainer.classList.remove("can-pan");
+        modalZoomContainer.classList.remove("dragging");
+      }
+    }
+
     function applyTransform() {
       if (!modalImage) {
         return;
       }
       clampTranslations();
       modalImage.style.transform = `translate(${translateX}px, ${translateY}px) scale(${scale})`;
+      updatePanState();
     }
 
     function getBaseSize() {
@@ -307,15 +328,16 @@
         event.preventDefault();
         const delta = event.deltaY;
         const zoomFactor = delta < 0 ? 1.1 : 0.9;
-        const newScale = Math.min(Math.max(scale * zoomFactor, 1), 6);
+        const newScale = Math.min(Math.max(scale * zoomFactor, 0.3), 6);
         if (Math.abs(newScale - scale) < 0.001) {
           return;
         }
         const rect = modalZoomContainer.getBoundingClientRect();
         const pointerX = event.clientX - rect.left - rect.width / 2;
         const pointerY = event.clientY - rect.top - rect.height / 2;
-        translateX -= pointerX * (newScale / scale - 1);
-        translateY -= pointerY * (newScale / scale - 1);
+        // Keep the zoom centred around the pointer position instead of the image centre.
+        translateX += pointerX * (1 / newScale - 1 / scale);
+        translateY += pointerY * (1 / newScale - 1 / scale);
         scale = newScale;
         applyTransform();
       });
@@ -330,6 +352,7 @@
         originTranslateX = translateX;
         originTranslateY = translateY;
         modalZoomContainer.setPointerCapture(event.pointerId);
+        modalZoomContainer.classList.add("dragging");
       });
 
       modalZoomContainer.addEventListener("pointermove", function (event) {
@@ -347,6 +370,8 @@
         }
         isDragging = false;
         modalZoomContainer.releasePointerCapture(event.pointerId);
+        modalZoomContainer.classList.remove("dragging");
+        applyTransform();
       }
 
       modalZoomContainer.addEventListener("pointerup", endDrag);

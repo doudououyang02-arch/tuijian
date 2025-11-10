@@ -38,7 +38,11 @@
               data-upload-preview="{{ uploaded_image_url if uploaded_image_url else '' }}"
             >
               <div class="composer-body">
-                <div class="thumbnail" data-role="thumbnail">
+                <div
+                  class="thumbnail"
+                  data-role="thumbnail"
+                  {% if not uploaded_image_url %}hidden{% endif %}
+                >
                   <img
                     src="{{ uploaded_image_url if uploaded_image_url else '' }}"
                     alt="上传图片预览"
@@ -48,14 +52,16 @@
                     ×
                   </button>
                 </div>
-                <input
-                  type="text"
-                  name="query"
-                  id="query-input"
-                  value="{{ query }}"
-                  placeholder="请输入文本描述，或通过下方按钮上传图片"
-                  autocomplete="off"
-                />
+                <div class="composer-input">
+                  <input
+                    type="text"
+                    name="query"
+                    id="query-input"
+                    value="{{ query }}"
+                    placeholder="请输入文本描述，或通过下方按钮上传图片"
+                    autocomplete="off"
+                  />
+                </div>
               </div>
               <div class="composer-actions">
                 <input type="file" name="image" id="image-input" accept="image/*" hidden />
@@ -66,14 +72,16 @@
             </div>
 
             <div class="search-controls">
-              <label class="field">
-                <span>Top K</span>
-                <input type="number" name="top_k" min="1" max="50" value="{{ top_k }}" />
-              </label>
-              <label class="field toggle">
-                <input type="checkbox" name="debug" {% if debug_enabled %}checked{% endif %} />
-                <span>调试模式</span>
-              </label>
+              <div class="search-options">
+                <label class="field numeric">
+                  <span>Top K</span>
+                  <input type="number" name="top_k" min="1" max="50" value="{{ top_k }}" />
+                </label>
+                <label class="field toggle">
+                  <input type="checkbox" name="debug" {% if debug_enabled %}checked{% endif %} />
+                  <span>调试模式</span>
+                </label>
+              </div>
               <button type="submit" class="primary">开始检索</button>
             </div>
 
