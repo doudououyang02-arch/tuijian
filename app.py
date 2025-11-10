@@ -68,25 +68,30 @@ def _create_text_service() -> TextRecommender:
     return text_recommender
 
 
+def _path_to_static_url(path: Path) -> str:
+    """Convert a local file path under ``static`` into a browser URL."""
+
+    static_root = STATIC_ROOT.resolve()
+    display_path = Path(path)
+    if display_path.exists():
+        try:
+            relative = display_path.resolve().relative_to(static_root)
+            return url_for("static", filename=str(relative).replace(os.sep, "/"))
+        except ValueError:
+            return display_path.as_posix()
+    return display_path.as_posix()
+
+
 def _build_result_payload(
     results: List[RecommendationResult],
     debug_enabled: bool,
     include_descriptions: bool = False,
 ) -> List[Dict[str, Any]]:
     payload: List[Dict[str, Any]] = []
-    static_root = STATIC_ROOT.resolve()
     text_service: Optional[TextRecommender] = None
 
     for item in results:
-        display_path = Path(item.display_path)
-        if display_path.exists():
-            try:
-                relative = display_path.resolve().relative_to(static_root)
-                image_url = url_for("static", filename=str(relative).replace(os.sep, "/"))
-            except ValueError:
-                image_url = display_path.as_posix()
-        else:
-            image_url = display_path.as_posix()
+        image_url = _path_to_static_url(Path(item.display_path))
 
         description: Optional[str] = None
         if include_descriptions:
@@ -125,59 +130,29 @@ def index():
         "query": "",
         "top_k": 8,
         "debug_enabled": False,
-        "follow_top_k": 8,
         "mode": None,
+        "current_round": None,
+        "next_round": 1,
+        "uploaded_image_url": None,
     }
 
     if request.method == "POST":
-        action = request.form.get("action")
+        action = request.form.get("action", "search")
         top_k = int(request.form.get("top_k", 8))
         debug_enabled = request.form.get("debug", "off") == "on"
         include_descriptions = debug_enabled
+        search_round = int(request.form.get("search_round", 1))
+
+        context.update(
+            {
+                "top_k": top_k,
+                "debug_enabled": debug_enabled,
+                "next_round": search_round,
+            }
+        )
 
         try:
-            if action == "image":
-                file = request.files.get("image")
-                if not file or file.filename == "":
-                    raise ValueError("请先选择一张图片进行上传。")
-                uploaded_path = _save_upload(file)
-                service = _create_image_service()
-                batch_dir = RESULTS_DIR / uuid.uuid4().hex
-                results = service.recommend(
-                    str(uploaded_path), top_k=top_k, destination_dir=batch_dir
-                )
-                payload = _build_result_payload(results, debug_enabled, include_descriptions)
-                context.update(
-                    {
-                        "results": payload,
-                        "mode": "image",
-                        "top_k": top_k,
-                        "debug_enabled": debug_enabled,
-                        "uploaded_image": str(uploaded_path),
-                    }
-                )
-
-            elif action == "text":
-                query = request.form.get("query", "").strip()
-                if not query:
-                    raise ValueError("请输入用于检索的文本内容。")
-                service = _create_text_service()
-                batch_dir = RESULTS_DIR / uuid.uuid4().hex
-                results = service.recommend(
-                    query, top_k=top_k, destination_dir=batch_dir, include_descriptions=include_descriptions
-                )
-                payload = _build_result_payload(results, debug_enabled, include_descriptions)
-                context.update(
-                    {
-                        "results": payload,
-                        "mode": "text",
-                        "query": query,
-                        "top_k": top_k,
-                        "debug_enabled": debug_enabled,
-                    }
-                )
-
-            elif action == "follow":
+            if action == "follow":
                 selected_image = request.form.get("selected_image")
                 if not selected_image:
                     raise ValueError("请选择要继续检索的图片。")
@@ -194,20 +169,71 @@ def index():
                     {
                         "results": payload,
                         "mode": "follow",
-                        "top_k": top_k,
                         "debug_enabled": debug_enabled,
                         "follow_source": selected_image,
+                        "current_round": search_round,
+                        "next_round": search_round + 1,
+                        "uploaded_image_url": None,
                     }
                 )
+                flash(f"第{search_round}轮：基于图像继续检索完成。")
             else:
-                raise ValueError("无法识别的操作类型。")
+                query = request.form.get("query", "").strip()
+                file = request.files.get("image")
+                has_text = bool(query)
+                has_image = bool(file and file.filename)
+
+                if has_image and not has_text:
+                    uploaded_path = _save_upload(file)
+                    service = _create_image_service()
+                    batch_dir = RESULTS_DIR / uuid.uuid4().hex
+                    results = service.recommend(
+                        str(uploaded_path), top_k=top_k, destination_dir=batch_dir
+                    )
+                    payload = _build_result_payload(results, debug_enabled, include_descriptions)
+                    context.update(
+                        {
+                            "results": payload,
+                            "mode": "image",
+                            "uploaded_image": str(uploaded_path),
+                            "uploaded_image_url": _path_to_static_url(uploaded_path),
+                            "current_round": search_round,
+                            "next_round": search_round + 1,
+                            "query": "",
+                        }
+                    )
+                    flash(f"第{search_round}轮：基于上传图片完成检索。")
+                elif has_text:
+                    if has_image:
+                        flash("当前暂不支持图片与文本联合检索，已优先使用文本进行检索。")
+                    service = _create_text_service()
+                    batch_dir = RESULTS_DIR / uuid.uuid4().hex
+                    results = service.recommend(
+                        query,
+                        top_k=top_k,
+                        destination_dir=batch_dir,
+                        include_descriptions=include_descriptions,
+                    )
+                    payload = _build_result_payload(results, debug_enabled, include_descriptions)
+                    context.update(
+                        {
+                            "results": payload,
+                            "mode": "text",
+                            "query": query,
+                            "current_round": search_round,
+                            "next_round": search_round + 1,
+                            "uploaded_image_url": None,
+                        }
+                    )
+                    flash(f"第{search_round}轮：基于文本完成检索。")
+                else:
+                    raise ValueError("请输入文本内容或上传图片后再发起检索。")
         except Exception as exc:  # pylint: disable=broad-except
             flash(str(exc))
             context.update(
                 {
-                    "top_k": top_k,
-                    "debug_enabled": debug_enabled,
                     "query": request.form.get("query", ""),
+                    "next_round": search_round,
                 }
             )
 
