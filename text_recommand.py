@@ -1,74 +1,180 @@
-rom FlagEmbedding import BGEM3FlagModel
-import numpy as np
-from sentence_transformers import util
-import torch
+"""Text-based image recommendation utilities for the web demo."""
+from __future__ import annotations
+
+import json
 import shutil
-import os
+from dataclasses import dataclass
+from pathlib import Path
+from typing import Iterable, List, Optional
 
-m3 = BGEM3FlagModel("/mnt/vdb2t_1/sujunyan/program/ui/image_features_extract/models/baai_bge-m3/baai_bg3-m3", use_fp16=False)  # 1024 维，最长 8192 tokens
+import numpy as np
 
-
-# 保存到本地
-text_embeddings_matrix = np.load("text_embeddings_8820.npy")
-    
-
-path_matrix = np.load("path_matrix_8820.npy")
-
-
-def cosine(a, b):  # a:[d], b:[N,d]
-    a = a / (np.linalg.norm(a) + 1e-9)
-    b = b / (np.linalg.norm(b, axis=1, keepdims=True) + 1e-9)
-    return (b @ a).reshape(-1)
-
-def lexical_score(q_ws, d_ws):
-    # 官方给了 compute_lexical_matching_score；这里示意手工版本
-    s = 0.0
-    for tok, w in q_ws.items():
-        if tok in d_ws: s += w * d_ws[tok]
-    return s
-
-def colbert_maxsim(q_vecs, d_vecs):
-    # 官方提供 model.colbert_score；这里给一个近似实现
-    import numpy as np
-    qn = q_vecs / (np.linalg.norm(q_vecs, axis=1, keepdims=True) + 1e-9)
-    dn = d_vecs / (np.linalg.norm(d_vecs, axis=1, keepdims=True) + 1e-9)
-    return (qn @ dn.T).max(axis=1).mean()
-
-query = "4行5列的表格"
-
-q_out = m3.encode(
-    [query],
-    return_dense=True, return_sparse=True, return_colbert_vecs=True
+# Default file locations taken from the prototype script.
+DEFAULT_MODEL_PATH = (
+    "/mnt/vdb2t_1/sujunyan/program/ui/image_features_extract/models/baai_bge-m3/baai_bg3-m3"
 )
-q_dense = q_out["dense_vecs"][0]
-q_ws    = q_out["lexical_weights"][0]
-q_cols  = q_out["colbert_vecs"][0]
+DEFAULT_TEXT_EMBEDDINGS = "text_embeddings_8820.npy"
+DEFAULT_PATH_MATRIX = "path_matrix_8820.npy"
 
-# 3. 计算相似度（矩阵化）
-# 稠密向量的余弦相似度
-dense_sim = util.cos_sim(q_dense, text_embeddings_matrix)  # [1, N]
-dense_sim = dense_sim.reshape(-1)  # 扁平化为 1D
 
-scores = dense_sim
-print(scores)
+@dataclass
+class TextRecommendationResult:
+    source_path: str
+    score: Optional[float]
+    display_path: Path
+    description: Optional[str] = None
 
-# 5. 按分数排序获取 Top-K 候选
-topk = torch.argsort(scores,descending=True)[:10]
-candidates = [(scores[i], path_matrix[i]) for i in topk]
+    @property
+    def filename(self) -> str:
+        return Path(self.source_path).name
 
-# 输出 Top-K
-for score, text in candidates:
-    print(f"Score: {score:.4f} | Text: {text}")
-    
-    # img_path = image_paths[idx]  # 从编码矩阵中获取对应的图像路径
-    img_name = os.path.basename(text)
 
-    json_path = os.path.join("/".join(text.split("/")[:-1]).replace("final_good", "final_good_json"), img_name.replace(".png", ".json"))
-    # print(json_path)
-    # exit()
-    output_path = os.path.join("./text_results", f"{img_name}")
-    output_json_path = os.path.join("./text_results", f"{os.path.basename(json_path)}")
-    os.makedirs("./text_results", exist_ok=True)
-    shutil.copy(text, output_path)  # 将最相似的图像复制到新的文件夹
-    shutil.copy(json_path, output_json_path)  # 将最相似的图像复制到新的文件夹
-    print(f"Saved similar image: {img_name} to {output_path}")
+def _cosine_similarity(a: np.ndarray, b: np.ndarray) -> np.ndarray:
+    if a.ndim == 1:
+        a = a.reshape(1, -1)
+    if b.ndim == 1:
+        b = b.reshape(1, -1)
+
+    a_norm = a / (np.linalg.norm(a, axis=1, keepdims=True) + 1e-12)
+    b_norm = b / (np.linalg.norm(b, axis=1, keepdims=True) + 1e-12)
+    return a_norm @ b_norm.T
+
+
+class TextRecommender:
+    """Helper that turns text queries into image recommendations."""
+
+    def __init__(
+        self,
+        model_path: str = DEFAULT_MODEL_PATH,
+        embeddings_path: str = DEFAULT_TEXT_EMBEDDINGS,
+        image_paths_path: str = DEFAULT_PATH_MATRIX,
+        use_fp16: bool = False,
+    ) -> None:
+        self.model_path = model_path
+        self.embeddings_path = Path(embeddings_path) if embeddings_path else None
+        self.image_paths_path = Path(image_paths_path) if image_paths_path else None
+        self.use_fp16 = use_fp16
+
+        self._model = None
+        self._embeddings: Optional[np.ndarray] = None
+        self._image_paths: Optional[List[str]] = None
+
+    def _load_model(self) -> None:
+        if self._model is not None:
+            return
+        from FlagEmbedding import BGEM3FlagModel
+
+        if not self.model_path:
+            raise ValueError("Model path must be provided for text recommendations.")
+
+        self._model = BGEM3FlagModel(self.model_path, use_fp16=self.use_fp16)
+
+    def _load_embeddings(self) -> np.ndarray:
+        if self._embeddings is None:
+            if not self.embeddings_path:
+                raise ValueError("Embeddings path is required for text recommendations.")
+            if not self.embeddings_path.exists():
+                raise FileNotFoundError(f"Text embeddings not found: {self.embeddings_path}")
+            self._embeddings = np.load(self.embeddings_path)
+        return self._embeddings
+
+    def _load_image_paths(self) -> List[str]:
+        if self._image_paths is None:
+            if not self.image_paths_path:
+                raise ValueError("Image paths matrix is required for text recommendations.")
+            if not self.image_paths_path.exists():
+                raise FileNotFoundError(f"Image path matrix not found: {self.image_paths_path}")
+            paths = np.load(self.image_paths_path)
+            self._image_paths = [str(p) for p in paths.tolist()]
+        return self._image_paths
+
+    def _encode(self, texts: Iterable[str]) -> np.ndarray:
+        self._load_model()
+        assert self._model is not None
+        outputs = self._model.encode(
+            list(texts), return_dense=True, return_sparse=True, return_colbert_vecs=True
+        )
+        dense_vectors = outputs["dense_vecs"]
+        if isinstance(dense_vectors, list):
+            return np.vstack([np.array(vec) for vec in dense_vectors])
+        return np.array(dense_vectors)
+
+    def recommend(
+        self,
+        query: str,
+        top_k: int = 10,
+        destination_dir: Optional[Path] = None,
+        include_descriptions: bool = False,
+    ) -> List[TextRecommendationResult]:
+        if top_k <= 0:
+            raise ValueError("top_k must be greater than zero.")
+        if not query:
+            raise ValueError("Query must not be empty.")
+
+        embeddings = self._load_embeddings()
+        image_paths = self._load_image_paths()
+        query_embedding = self._encode([query])[0]
+        scores = _cosine_similarity(query_embedding, embeddings)[0]
+        top_indices = np.argsort(scores)[::-1][:top_k]
+
+        copy_destination: Optional[Path] = None
+        if destination_dir is not None:
+            copy_destination = Path(destination_dir)
+            copy_destination.mkdir(parents=True, exist_ok=True)
+
+        results: List[TextRecommendationResult] = []
+        for idx in top_indices:
+            source_path = Path(image_paths[idx])
+            score = float(scores[idx]) if scores is not None else None
+            display_path = source_path
+            if copy_destination is not None:
+                target_file = copy_destination / source_path.name
+                if source_path.exists():
+                    if source_path.resolve() != target_file.resolve():
+                        shutil.copy2(source_path, target_file)
+                    display_path = target_file
+                else:
+                    display_path = target_file
+
+            description = None
+            if include_descriptions:
+                description = self.get_description(str(source_path))
+            results.append(TextRecommendationResult(str(source_path), score, display_path, description))
+
+        return results
+
+    def get_description(self, image_path: str) -> Optional[str]:
+        json_path = self._infer_json_path(image_path)
+        if json_path is None or not json_path.exists():
+            return None
+        with json_path.open("r", encoding="utf-8") as file:
+            data = json.load(file)
+        return json.dumps(data, ensure_ascii=False, indent=2)
+
+    def recommend_from_image(
+        self,
+        image_path: str,
+        top_k: int = 10,
+        destination_dir: Optional[Path] = None,
+        include_descriptions: bool = False,
+    ) -> List[TextRecommendationResult]:
+        description = self.get_description(image_path)
+        if not description:
+            raise FileNotFoundError(
+                "Unable to locate description JSON for the selected image; cannot start follow-up search."
+            )
+        return self.recommend(description, top_k, destination_dir, include_descriptions)
+
+    @staticmethod
+    def _infer_json_path(image_path: str) -> Optional[Path]:
+        if not image_path:
+            return None
+        source = Path(image_path)
+        json_candidate = source.with_suffix(".json")
+        candidate_str = str(json_candidate)
+        if "final_good" in candidate_str:
+            candidate_str = candidate_str.replace("final_good", "final_good_json")
+        return Path(candidate_str)
+
+
+__all__ = ["TextRecommender", "TextRecommendationResult"]
