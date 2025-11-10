@@ -1,0 +1,199 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>HWDesign 图像推荐系统演示</title>
+    <link rel="stylesheet" href="{{ url_for('static', filename='css/styles.css') }}" />
+    <script src="{{ url_for('static', filename='js/app.js') }}" defer></script>
+  </head>
+  <body
+    class="{% if results %}has-results{% else %}landing{% endif %}"
+    data-debug="{{ 'true' if debug_enabled else 'false' }}"
+  >
+    <main class="page">
+      <header class="masthead">
+        <span class="logo" aria-label="HWDesign">HWDesign</span>
+      </header>
+
+      {% with messages = get_flashed_messages() %}
+        {% if messages %}
+          <div class="alerts">
+            {% for message in messages %}
+              <p>{{ message }}</p>
+            {% endfor %}
+          </div>
+        {% endif %}
+      {% endwith %}
+
+      <section class="search-section">
+        <div class="search-card">
+          <form id="search-form" method="post" enctype="multipart/form-data">
+            <input type="hidden" name="action" value="search" />
+            <input type="hidden" name="search_round" value="{{ next_round }}" />
+
+            <div
+              class="search-composer"
+              id="search-dropzone"
+              data-upload-preview="{{ uploaded_image_url if uploaded_image_url else '' }}"
+            >
+              <div class="composer-body">
+                <div
+                  class="thumbnail"
+                  data-role="thumbnail"
+                  {% if not uploaded_image_url %}hidden{% endif %}
+                >
+                  <img
+                    src="{{ uploaded_image_url if uploaded_image_url else '' }}"
+                    alt="上传图片预览"
+                    {% if not uploaded_image_url %}hidden{% endif %}
+                  />
+                  <button type="button" class="thumbnail-remove" data-role="remove-image" aria-label="移除图片">
+                    ×
+                  </button>
+                </div>
+                <div class="composer-input">
+                  <input
+                    type="text"
+                    name="query"
+                    id="query-input"
+                    value="{{ query }}"
+                    placeholder="请输入文本描述，或通过下方按钮上传图片"
+                    autocomplete="off"
+                  />
+                </div>
+              </div>
+              <div class="composer-actions">
+                <input type="file" name="image" id="image-input" accept="image/*" hidden />
+                <button type="button" class="upload-trigger" id="upload-trigger" aria-label="上传图片">
+                  <span class="icon-plus" aria-hidden="true"></span>
+                </button>
+              </div>
+            </div>
+
+            <div class="search-controls">
+              <div class="search-options">
+                <label class="field numeric">
+                  <span>Top K</span>
+                  <input type="number" name="top_k" min="1" max="50" value="{{ top_k }}" />
+                </label>
+                <label class="field toggle">
+                  <input type="checkbox" name="debug" {% if debug_enabled %}checked{% endif %} />
+                  <span>调试模式</span>
+                </label>
+              </div>
+              <button type="submit" class="primary">开始检索</button>
+            </div>
+
+            <p class="round-indicator">
+              {% if current_round %}
+                当前展示第 <strong>{{ current_round }}</strong> 轮检索结果，可继续发起第 {{ next_round }} 轮搜索。
+              {% else %}
+                即将开始第 <strong>{{ next_round }}</strong> 轮搜索。
+              {% endif %}
+            </p>
+          </form>
+        </div>
+      </section>
+
+      {% if results %}
+        <section class="results-section">
+          <header class="results-toolbar">
+            <div class="results-title">
+              <h2>第 {{ current_round }} 轮推荐结果</h2>
+              {% if mode == 'image' %}
+                <p>基于上传图片的相似检索。</p>
+              {% elif mode == 'text' %}
+                <p>基于文本描述的相似检索。</p>
+              {% elif mode == 'follow' %}
+                <p>基于所选图片的继续检索。</p>
+              {% endif %}
+            </div>
+            <form id="follow-form" method="post" class="follow-form">
+              <input type="hidden" name="action" value="follow" />
+              <input type="hidden" name="selected_image" id="follow-image-input" />
+              <input type="hidden" name="debug" value="{% if debug_enabled %}on{% else %}off{% endif %}" />
+              <input type="hidden" name="search_round" value="{{ next_round }}" />
+              <label class="field">
+                <span>下一轮 Top K</span>
+                <input type="number" name="top_k" id="follow-topk-input" value="{{ top_k }}" min="1" max="50" />
+              </label>
+            </form>
+          </header>
+
+          <div class="masonry-grid" data-debug="{{ 'true' if debug_enabled else 'false' }}">
+            {% for item in results %}
+              <article class="masonry-item" data-source="{{ item.source_path }}">
+                <div class="item-media">
+                  <img
+                    src="{{ item.image_url }}"
+                    alt="{{ item.filename }}"
+                    loading="lazy"
+                    data-description='{{ item.description | tojson | safe }}'
+                    data-filename="{{ item.filename }}"
+                    data-score="{{ item.score if item.score else '' }}"
+                    data-source="{{ item.source_path }}"
+                  />
+                  <div class="item-overlay">
+                    <button
+                      type="button"
+                      class="overlay-btn continue"
+                      data-role="continue-search"
+                      data-source="{{ item.source_path }}"
+                    >
+                      <span class="icon-search" aria-hidden="true"></span>
+                      <span>继续探索</span>
+                    </button>
+                    <button
+                      type="button"
+                      class="overlay-btn preview"
+                      data-role="open-modal"
+                      data-url="{{ item.image_url }}"
+                      data-description='{{ item.description | tojson | safe }}'
+                      data-filename="{{ item.filename }}"
+                      data-score="{{ item.score if item.score else '' }}"
+                      data-source="{{ item.source_path }}"
+                    >
+                      <span class="icon-zoom" aria-hidden="true"></span>
+                    </button>
+                  </div>
+                </div>
+                <footer class="item-meta">
+                  <p class="item-path" title="{{ item.source_path }}">{{ item.filename }}</p>
+                  {% if item.score %}
+                    <p class="item-score">相似度 {{ item.score }}</p>
+                  {% endif %}
+                </footer>
+              </article>
+            {% endfor %}
+          </div>
+        </section>
+      {% endif %}
+    </main>
+
+    <section
+      id="image-modal"
+      class="modal"
+      data-debug="{{ 'true' if debug_enabled else 'false' }}"
+      aria-hidden="true"
+    >
+      <div class="modal-backdrop" data-role="close-modal"></div>
+      <div class="modal-dialog" role="dialog" aria-modal="true">
+        <button type="button" class="modal-close" data-role="close-modal" aria-label="关闭">×</button>
+        <div class="modal-main">
+          <div class="modal-figure" id="modal-zoom-container">
+            <img id="modal-image" alt="放大预览" />
+          </div>
+          <aside id="modal-json" class="modal-json" aria-label="调试信息"></aside>
+        </div>
+        <footer class="modal-footer">
+          <div class="modal-meta">
+            <span id="modal-filename"></span>
+            <span id="modal-score"></span>
+            <span id="modal-source"></span>
+          </div>
+        </footer>
+      </div>
+    </section>
+  </body>
+</html>
