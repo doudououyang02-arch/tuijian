@@ -1,4 +1,4 @@
-"""Text-based image recommendation utilities for the web demo."""
+"""Qwen-based text retrieval helper aligned with the existing demo API."""
 from __future__ import annotations
 
 import json
@@ -9,34 +9,22 @@ from typing import Iterable, List, Optional
 
 import numpy as np
 
-# Default file locations taken from the prototype script.
-DEFAULT_MODEL_PATH = (
-    "/mnt/vdb2t_1/sujunyan/program/ui/image_features_extract/models/baai_bge-m3/baai_bg3-m3"
-)
-DEFAULT_TEXT_EMBEDDINGS = "text_embeddings_8820.npy"
-DEFAULT_PATH_MATRIX = "path_matrix_8820.npy"
+default_qwen_model = "Qwen/Qwen2.5-7B-Instruct"
 
-# Round-aware defaults to support progressive recall strategies.
-DEFAULT_TEXT_EMBEDDINGS_ROUND1 = DEFAULT_TEXT_EMBEDDINGS
-DEFAULT_PATH_MATRIX_ROUND1 = DEFAULT_PATH_MATRIX
+try:
+    # Reuse the common result type to minimize UI branching.
+    from text_recommand import TextRecommendationResult  # type: ignore
+except Exception:  # pragma: no cover - defensive for missing dependency
+    @dataclass
+    class TextRecommendationResult:  # fallback to keep type stability when imports fail
+        source_path: str
+        score: Optional[float]
+        display_path: Path
+        description: Optional[str] = None
 
-DEFAULT_TEXT_EMBEDDINGS_ROUND2 = "text_embeddings_8820_all_content.npy"
-DEFAULT_PATH_MATRIX_ROUND2 = "path_matrix_8820_content_all_content.npy"
-
-DEFAULT_TEXT_EMBEDDINGS_ROUND3 = "text_embeddings_8820_top_sementic.npy"
-DEFAULT_PATH_MATRIX_ROUND3 = "path_matrix_8820_top_sementic.npy"
-
-
-@dataclass
-class TextRecommendationResult:
-    source_path: str
-    score: Optional[float]
-    display_path: Path
-    description: Optional[str] = None
-
-    @property
-    def filename(self) -> str:
-        return Path(self.source_path).name
+        @property
+        def filename(self) -> str:
+            return Path(self.source_path).name
 
 
 def _cosine_similarity(a: np.ndarray, b: np.ndarray) -> np.ndarray:
@@ -50,34 +38,45 @@ def _cosine_similarity(a: np.ndarray, b: np.ndarray) -> np.ndarray:
     return a_norm @ b_norm.T
 
 
-class TextRecommender:
-    """Helper that turns text queries into image recommendations."""
+class QwenTextRecommender:
+    """Use a Qwen model to embed text for image retrieval.
+
+    The interface mirrors ``TextRecommender`` so the Flask app can swap models
+    with minimal branching. Heavy dependencies are imported lazily so the file
+    can be compiled without the runtime model being present.
+    """
 
     def __init__(
         self,
-        model_path: str = DEFAULT_MODEL_PATH,
-        embeddings_path: str = DEFAULT_TEXT_EMBEDDINGS,
-        image_paths_path: str = DEFAULT_PATH_MATRIX,
-        use_fp16: bool = False,
+        model_name: str = default_qwen_model,
+        embeddings_path: Optional[str] = None,
+        image_paths_path: Optional[str] = None,
+        device: Optional[str] = None,
     ) -> None:
-        self.model_path = model_path
+        self.model_name = model_name or default_qwen_model
         self.embeddings_path = Path(embeddings_path) if embeddings_path else None
         self.image_paths_path = Path(image_paths_path) if image_paths_path else None
-        self.use_fp16 = use_fp16
+        self.device = device
 
+        self._tokenizer = None
         self._model = None
         self._embeddings: Optional[np.ndarray] = None
         self._image_paths: Optional[List[str]] = None
 
     def _load_model(self) -> None:
-        if self._model is not None:
+        if self._model is not None and self._tokenizer is not None:
             return
-        from FlagEmbedding import BGEM3FlagModel
+        from transformers import AutoModel, AutoTokenizer
+        import torch
 
-        if not self.model_path:
-            raise ValueError("Model path must be provided for text recommendations.")
-
-        self._model = BGEM3FlagModel(self.model_path, use_fp16=self.use_fp16)
+        self._tokenizer = AutoTokenizer.from_pretrained(self.model_name)
+        self._model = AutoModel.from_pretrained(self.model_name)
+        if self.device:
+            self._model = self._model.to(self.device)
+        else:
+            # Fall back to GPU when available without forcing the dependency.
+            if torch.cuda.is_available():
+                self._model = self._model.cuda()
 
     def _load_embeddings(self) -> np.ndarray:
         if self._embeddings is None:
@@ -100,14 +99,27 @@ class TextRecommender:
 
     def _encode(self, texts: Iterable[str]) -> np.ndarray:
         self._load_model()
-        assert self._model is not None
-        outputs = self._model.encode(
-            list(texts), return_dense=True, return_sparse=True, return_colbert_vecs=True
+        assert self._tokenizer is not None and self._model is not None
+        import torch
+
+        encoded = self._tokenizer(
+            list(texts),
+            return_tensors="pt",
+            padding=True,
+            truncation=True,
+            max_length=1024,
         )
-        dense_vectors = outputs["dense_vecs"]
-        if isinstance(dense_vectors, list):
-            return np.vstack([np.array(vec) for vec in dense_vectors])
-        return np.array(dense_vectors)
+        if self.device:
+            encoded = {k: v.to(self.device) for k, v in encoded.items()}
+        elif next(self._model.parameters()).is_cuda:
+            encoded = {k: v.cuda() for k, v in encoded.items()}
+
+        with torch.no_grad():
+            outputs = self._model(**encoded)
+            hidden = outputs.last_hidden_state
+            pooled = hidden.mean(dim=1)
+            normalized = torch.nn.functional.normalize(pooled, p=2, dim=1)
+        return normalized.cpu().numpy()
 
     def recommend(
         self,
@@ -153,14 +165,6 @@ class TextRecommender:
 
         return results
 
-    def get_description(self, image_path: str) -> Optional[str]:
-        json_path = self._infer_json_path(image_path)
-        if json_path is None or not json_path.exists():
-            return None
-        with json_path.open("r", encoding="utf-8") as file:
-            data = json.load(file)
-        return json.dumps(data, ensure_ascii=False, indent=2)
-
     def recommend_from_image(
         self,
         image_path: str,
@@ -176,15 +180,19 @@ class TextRecommender:
         return self.recommend(description, top_k, destination_dir, include_descriptions)
 
     @staticmethod
-    def _infer_json_path(image_path: str) -> Optional[Path]:
+    def get_description(image_path: str) -> Optional[str]:
         if not image_path:
             return None
-        source = Path(image_path)
-        json_candidate = source.with_suffix(".json")
-        candidate_str = str(json_candidate)
-        if "final_good" in candidate_str:
-            candidate_str = candidate_str.replace("final_good", "final_good_json")
-        return Path(candidate_str)
+        json_path = Path(image_path).with_suffix(".json")
+        candidate = str(json_path)
+        if "final_good" in candidate:
+            candidate = candidate.replace("final_good", "final_good_json")
+        json_path = Path(candidate)
+        if not json_path.exists():
+            return None
+        with json_path.open("r", encoding="utf-8") as file:
+            data = json.load(file)
+        return json.dumps(data, ensure_ascii=False, indent=2)
 
 
-__all__ = ["TextRecommender", "TextRecommendationResult"]
+__all__ = ["QwenTextRecommender", "default_qwen_model"]
