@@ -1,15 +1,24 @@
-"""Qwen-based text retrieval helper aligned with the existing demo API."""
+"""Qwen3-based text retrieval module aligned with the existing recommender API."""
 from __future__ import annotations
 
 import json
+import os
 import shutil
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Iterable, List, Optional
 
 import numpy as np
+import torch
+import torch.nn.functional as F
+from sentence_transformers import util
+from torch import Tensor
+from transformers import AutoModel, AutoTokenizer
 
-default_qwen_model = "Qwen/Qwen2.5-7B-Instruct"
+# Local default to match the provided working setup; override with QWEN_MODEL_PATH if needed.
+DEFAULT_QWEN_MODEL = os.getenv(
+    "QWEN_MODEL_PATH", "/home/s50052424/UIRecommend/Qwen3-Embedding-8B/"
+)
 
 try:
     # Reuse the common result type to minimize UI branching.
@@ -27,64 +36,59 @@ except Exception:  # pragma: no cover - defensive for missing dependency
             return Path(self.source_path).name
 
 
-def _cosine_similarity(a: np.ndarray, b: np.ndarray) -> np.ndarray:
-    if a.ndim == 1:
-        a = a.reshape(1, -1)
-    if b.ndim == 1:
-        b = b.reshape(1, -1)
+def _last_token_pool(last_hidden_states: Tensor, attention_mask: Tensor) -> Tensor:
+    """Pool the last non-masked token as embedding (handles left padding)."""
 
-    a_norm = a / (np.linalg.norm(a, axis=1, keepdims=True) + 1e-12)
-    b_norm = b / (np.linalg.norm(b, axis=1, keepdims=True) + 1e-12)
-    return a_norm @ b_norm.T
+    left_padding = (attention_mask[:, -1].sum() == attention_mask.shape[0])
+    if left_padding:
+        return last_hidden_states[:, -1]
+    sequence_lengths = attention_mask.sum(dim=1) - 1
+    batch_size = last_hidden_states.shape[0]
+    return last_hidden_states[torch.arange(batch_size, device=last_hidden_states.device), sequence_lengths]
 
 
 class QwenTextRecommender:
-    """Use a Qwen model to embed text for image retrieval.
-
-    The interface mirrors ``TextRecommender`` so the Flask app can swap models
-    with minimal branching. Heavy dependencies are imported lazily so the file
-    can be compiled without the runtime model being present.
-    """
+    """Use Qwen3 embeddings for text-to-image recommendation."""
 
     def __init__(
         self,
-        model_name: str = default_qwen_model,
+        model_path: str = DEFAULT_QWEN_MODEL,
         embeddings_path: Optional[str] = None,
         image_paths_path: Optional[str] = None,
         device: Optional[str] = None,
     ) -> None:
-        self.model_name = model_name or default_qwen_model
+        self.model_path = model_path or DEFAULT_QWEN_MODEL
         self.embeddings_path = Path(embeddings_path) if embeddings_path else None
         self.image_paths_path = Path(image_paths_path) if image_paths_path else None
         self.device = device
 
-        self._tokenizer = None
-        self._model = None
-        self._embeddings: Optional[np.ndarray] = None
+        self._tokenizer: Optional[AutoTokenizer] = None
+        self._model: Optional[AutoModel] = None
+        self._embeddings: Optional[torch.Tensor] = None
         self._image_paths: Optional[List[str]] = None
+
+    @property
+    def _model_device(self) -> torch.device:
+        if self.device:
+            return torch.device(self.device)
+        return torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
     def _load_model(self) -> None:
         if self._model is not None and self._tokenizer is not None:
             return
-        from transformers import AutoModel, AutoTokenizer
-        import torch
+        self._tokenizer = AutoTokenizer.from_pretrained(self.model_path, padding_side="left")
+        self._model = AutoModel.from_pretrained(self.model_path, torch_dtype=torch.bfloat16)
+        self._model = self._model.to(self._model_device).eval()
 
-        self._tokenizer = AutoTokenizer.from_pretrained(self.model_name)
-        self._model = AutoModel.from_pretrained(self.model_name)
-        if self.device:
-            self._model = self._model.to(self.device)
-        else:
-            # Fall back to GPU when available without forcing the dependency.
-            if torch.cuda.is_available():
-                self._model = self._model.cuda()
-
-    def _load_embeddings(self) -> np.ndarray:
+    def _load_embeddings(self) -> torch.Tensor:
         if self._embeddings is None:
             if not self.embeddings_path:
                 raise ValueError("Embeddings path is required for text recommendations.")
             if not self.embeddings_path.exists():
                 raise FileNotFoundError(f"Text embeddings not found: {self.embeddings_path}")
-            self._embeddings = np.load(self.embeddings_path)
+            # Keep embeddings on the same device as the model for similarity search.
+            array = np.load(self.embeddings_path)
+            self._embeddings = torch.tensor(array, device=self._model_device)
         return self._embeddings
 
     def _load_image_paths(self) -> List[str]:
@@ -94,32 +98,25 @@ class QwenTextRecommender:
             if not self.image_paths_path.exists():
                 raise FileNotFoundError(f"Image path matrix not found: {self.image_paths_path}")
             paths = np.load(self.image_paths_path)
-            self._image_paths = [str(p) for p in paths.tolist()]
+            self._image_paths = [str(p).replace("mnt/vdb2t_1/sujunyan/label30000", "home/s50052424/UIRecommend") for p in paths.tolist()]
         return self._image_paths
 
-    def _encode(self, texts: Iterable[str]) -> np.ndarray:
+    def _encode(self, texts: Iterable[str]) -> torch.Tensor:
         self._load_model()
         assert self._tokenizer is not None and self._model is not None
-        import torch
 
-        encoded = self._tokenizer(
+        batch_dict = self._tokenizer(
             list(texts),
-            return_tensors="pt",
             padding=True,
             truncation=True,
-            max_length=1024,
-        )
-        if self.device:
-            encoded = {k: v.to(self.device) for k, v in encoded.items()}
-        elif next(self._model.parameters()).is_cuda:
-            encoded = {k: v.cuda() for k, v in encoded.items()}
+            max_length=8192,
+            return_tensors="pt",
+        ).to(self._model_device)
 
         with torch.no_grad():
-            outputs = self._model(**encoded)
-            hidden = outputs.last_hidden_state
-            pooled = hidden.mean(dim=1)
-            normalized = torch.nn.functional.normalize(pooled, p=2, dim=1)
-        return normalized.cpu().numpy()
+            outputs = self._model(**batch_dict)
+        embeddings = _last_token_pool(outputs.last_hidden_state, batch_dict["attention_mask"])
+        return F.normalize(embeddings, p=2, dim=1)
 
     def recommend(
         self,
@@ -136,8 +133,10 @@ class QwenTextRecommender:
         embeddings = self._load_embeddings()
         image_paths = self._load_image_paths()
         query_embedding = self._encode([query])[0]
-        scores = _cosine_similarity(query_embedding, embeddings)[0]
-        top_indices = np.argsort(scores)[::-1][:top_k]
+
+        with torch.no_grad():
+            scores = util.cos_sim(query_embedding.float(), embeddings).reshape(-1)
+        top_indices = torch.argsort(scores, descending=True)[:top_k]
 
         copy_destination: Optional[Path] = None
         if destination_dir is not None:
@@ -145,9 +144,9 @@ class QwenTextRecommender:
             copy_destination.mkdir(parents=True, exist_ok=True)
 
         results: List[TextRecommendationResult] = []
-        for idx in top_indices:
+        for idx in top_indices.tolist():
             source_path = Path(image_paths[idx])
-            score = float(scores[idx]) if scores is not None else None
+            score = float(scores[idx].item()) if scores is not None else None
             display_path = source_path
             if copy_destination is not None:
                 target_file = copy_destination / source_path.name
@@ -195,4 +194,4 @@ class QwenTextRecommender:
         return json.dumps(data, ensure_ascii=False, indent=2)
 
 
-__all__ = ["QwenTextRecommender", "default_qwen_model"]
+__all__ = ["QwenTextRecommender", "DEFAULT_QWEN_MODEL"]
